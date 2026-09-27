@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ManageLabNotifications",
+      "Effect": "Allow",
+      "Action": [
+        "sns:CreateTopic", "sns:DeleteTopic", "sns:GetTopicAttributes",
+        "sns:SetTopicAttributes", "sns:ListTagsForResource", "sns:TagResource",
+        "sns:UntagResource", "sns:Subscribe", "sns:Unsubscribe",
+        "sns:GetSubscriptionAttributes", "sns:SetSubscriptionAttributes",
+        "sns:ListSubscriptionsByTopic"
+      ],
+      "Resource": "arn:aws:sns:us-east-1:120569646436:linux-lab-alerts"
+    },
+    {
+      "Sid": "ManageLabAlarm",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms",
+        "cloudwatch:DescribeAlarms", "cloudwatch:DescribeAlarmHistory",
+        "cloudwatch:ListTagsForResource", "cloudwatch:TagResource",
+        "cloudwatch:UntagResource", "cloudwatch:SetAlarmState"
+      ],
+      "Resource": "arn:aws:cloudwatch:us-east-1:120569646436:alarm:linux-lab-status-check"
+    }
+  ]
+}

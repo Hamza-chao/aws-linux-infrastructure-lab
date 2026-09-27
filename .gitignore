@@ -1,0 +1,18 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+.env
+.env.*
+*.pem
+*.key
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Keep .terraform.lock.hcl: it records the provider version and checksums.

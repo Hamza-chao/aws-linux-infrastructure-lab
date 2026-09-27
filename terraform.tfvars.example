@@ -1,0 +1,8 @@
+aws_region = "us-east-1"
+
+# Replace this documentation-only address with YOUR public IPv4 address.
+# /32 means only that one address may open the Nginx page.
+allowed_http_cidr = "203.0.113.10/32"
+
+# Replace with your email and confirm the SNS subscription after applying.
+alert_email = "your-email@example.com"
