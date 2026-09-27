@@ -1,163 +1,165 @@
 # AWS Linux Infrastructure Lab
 
-Learn to provision, administer, troubleshoot, and recover a Linux server on AWS.
-The workload is Nginx's default welcome page. There is no custom web application.
+Terraform-managed AWS infrastructure demonstrating Linux administration, network
+access controls, service recovery, and email alerting. An Amazon Linux 2023 EC2
+instance runs Nginx as the workload, with administration through AWS Systems
+Manager Session Manager and EC2 health notifications through CloudWatch and SNS.
 
-**First milestone:** create one server, inspect it, stop and recover its web service,
-then remove the environment. Deployment, Session Manager access, Nginx recovery,
-and destruction/recreation have been exercised on AWS. CloudWatch-to-SNS email
-delivery has also been tested using a temporary alarm state change.
+**Technologies:** AWS EC2, VPC, IAM, Systems Manager, CloudWatch, SNS, EBS,
+Terraform, Linux, Bash, Nginx, and Git.
 
-## Start here
+## Architecture and design
 
-Read the network and server sections in `main.tf`. The first exercise needs only
-Terraform, AWS CLI authentication, and an AWS account. The lab now includes an
-EC2 status-check alarm and SNS email notifications. Backups, Ansible, and CI/CD
-are possible later exercises.
+- **Networking:** dedicated VPC and public subnet, with an internet gateway and
+  route table for internet connectivity.
+- **Access:** HTTP restricted to one configured public IPv4 address (`/32`).
+  Administration uses Session Manager with no inbound SSH rule.
+- **Server:** Amazon Linux 2023 on a `t3.micro`, with an encrypted 8 GiB gp3 root
+  volume and IMDSv2 required.
+- **Bootstrap:** a Bash startup script installs Nginx and enables Nginx and the
+  SSM agent to start automatically.
+- **Permissions:** an EC2 instance role provides the SSM agent's AWS permissions.
+  Separate deployment policies support Terraform and interactive administration.
+- **Monitoring:** a CloudWatch alarm evaluates EC2 `StatusCheckFailed` metrics
+  over two one-minute periods. SNS delivers notifications on ALARM and OK transitions.
+- **Cost control:** T3 standard CPU credits, root volume deletion on instance
+  termination, and explicit Terraform teardown after use.
+
+## Verified results
+
+| Area | Verification | Observed result |
+| --- | --- | --- |
+| Provisioning | Applied Terraform configuration | Network, IAM, EC2, and monitoring resources created successfully |
+| Remote administration | Connected through Session Manager | Interactive Linux shell without opening inbound SSH |
+| HTTP service | Opened the Nginx page and ran `curl -I http://localhost` | HTTP `200 OK` |
+| Service recovery | Stopped Nginx, checked HTTP, then restarted it | Connection failure while stopped; HTTP `200 OK` after restart |
+| Linux operations | Inspected service logs, access logs, disk, memory, processes, and listening ports | Confirmed Nginx requests and examined server resource usage |
+| Infrastructure lifecycle | Destroyed and recreated the original infrastructure | Terraform reported 10 resources destroyed, then 10 recreated |
+| Alert delivery | Confirmed SNS email subscription and temporarily set the alarm to ALARM | Received the alarm notification by email |
+
+The alert test verified the CloudWatch-to-SNS delivery path using a simulated alarm
+state. The configured metric monitors EC2 status checks; Nginx HTTP availability
+requires a separate application check. Lifecycle verification above covers the
+original infrastructure before monitoring was added.
+
+## Repository contents
 
 | File | Purpose |
 | --- | --- |
-| `main.tf` | Settings, network, server permissions, Linux server, and Nginx installation |
-| `terraform.tfvars.example` | Example region, browser access, and alert email settings |
+| `main.tf` | Infrastructure, server bootstrap, monitoring, inputs, and outputs |
+| `terraform.tfvars.example` | Example region, allowed IPv4 address, and alert email |
 | `lab-access-policy.json` | Deployment and Session Manager permissions |
-| `lab-monitoring-policy.json` | Permissions to manage the lab alarm and SNS topic |
-| `.gitignore` | Keeps local settings, Terraform state, and credentials out of Git |
-| `.terraform.lock.hcl` | Generated provider version/checksums; keep this in Git |
+| `lab-monitoring-policy.json` | Permissions for the lab's SNS topic and CloudWatch alarm |
+| `.terraform.lock.hcl` | Pinned provider version and checksums |
+| `.gitignore` | Excludes local settings, state, saved plans, and credential files |
 
-The traffic path is: your browser -> public IPv4 -> security group -> Nginx on port 80.
-The server sits in one public subnet in its own VPC. An internet gateway and route
-give it outbound connectivity for package installation and AWS Systems Manager.
-Administration uses Session Manager; no SSH key or inbound SSH rule is required.
+## Deployment
 
-## Prepare and check locally
+Prerequisites: Terraform 1.10 or later (below 2.0), AWS CLI v2, and an authenticated
+AWS identity with the lab deployment permissions. Commands below use PowerShell.
 
-Use PowerShell from this project folder. Install Terraform 1.10+ (below 2.0) and
-AWS CLI v2. The following checks download the provider but create no AWS resources:
+The IAM policy files use the lab account ID and `us-east-1`. Adapt their ARNs for
+another account. Install these policies using an identity authorized to manage
+IAM, and attach them to the deployment user group. The monitoring policy is a
+separate customer-managed policy. Deployment identity policies are managed
+outside this Terraform configuration.
 
-```powershell
-terraform init
-terraform fmt -check
-terraform validate
-```
-
-Copy settings once, then edit `terraform.tfvars`:
+Copy the example once and edit the local settings:
 
 ```powershell
 Copy-Item terraform.tfvars.example terraform.tfvars
 (Invoke-RestMethod https://checkip.amazonaws.com).Trim()
 ```
 
-Put the returned public IPv4 address followed by `/32` in `allowed_http_cidr`.
-The example `203.0.113.10` is a placeholder. Keep `/32`: it permits only your address.
-If your network or VPN changes your public IP, update this setting and apply again.
-Set `alert_email` to your email address. Keep `terraform.tfvars` out of Git.
+Set `allowed_http_cidr` to your current public IPv4 address followed by `/32`, and
+set `alert_email` to your email address. Update the allowed address if your network
+changes. Keep `terraform.tfvars` local.
 
-Use your configured AWS CLI profile. For a named profile, set
-`$env:AWS_PROFILE = "your-profile-name"` in this terminal. For an IAM Identity Center
-profile, authenticate with `aws sso login`. Verify the intended account:
+Authenticate your AWS CLI profile, then validate and review the deployment:
 
 ```powershell
+$env:AWS_PROFILE = "your-profile-name"
 aws sts get-caller-identity
-```
-
-Your deployment identity needs permissions to manage the lab's EC2/VPC and IAM
-resources, pass its instance role, and read the public SSM AMI parameter. Your
-console identity also needs permission to start Session Manager sessions. The
-instance role in `main.tf` grants permissions to the server, not to your user.
-Keep AWS credentials in the CLI configuration, outside this repository.
-
-The two policy JSON files record the permissions used in this lab. Their ARNs
-contain the lab account ID and use `us-east-1`; adapt those values for another
-account. Attach the monitoring policy as a separate customer-managed policy to
-the deployment user group. These IAM policies are installed separately from
-Terraform and remain after `terraform destroy`.
-
-## Deploy when ready
-
-Applying creates billable resources: a `t3.micro`, an 8 GiB EBS disk, and a public
-IPv4 address. CloudWatch alarms, SNS usage, and data transfer can also cost money. Check your account's pricing and
-credits first. This milestone has **manual teardown**, with no automatic expiry.
-
-```powershell
+terraform init
+terraform fmt -check
+terraform validate
 terraform plan "-out=lab.tfplan"
 ```
 
-Review the account, region, and proposed resources. When ready to create them:
+Review the account, region, and proposed changes before applying:
 
 ```powershell
 terraform apply "lab.tfplan"
 terraform output
 ```
 
-Give first boot several minutes to install Nginx. Open `website_url` using **HTTP**;
-TLS is not configured for this initial exercise. Terraform finishing does not prove
-Nginx is ready. The image follows the latest Amazon Linux 2023 release; a later
-plan may propose replacing the server. Changes to the boot script also replace it.
+Allow time for the startup script to install Nginx, then open `website_url` using
+HTTP from the permitted address. Confirm the SNS subscription using the email
+sent to `alert_email`.
 
-## Operate the server
+This is a single-instance lab using HTTP and local Terraform state. Its current
+scope covers provisioning and operations; it does not provide high availability
+or TLS. The AMI follows the latest Amazon Linux 2023 image, so a later plan may
+propose instance replacement. Changes to the startup script also replace the instance.
 
-In the AWS EC2 console, select the output `instance_id` in your configured region,
-then choose **Connect -> Session Manager -> Connect**. Run these Linux commands:
+## Operations and recovery
+
+Select the instance in the EC2 console, choose **Connect**, select **SSM Session
+Manager**, and connect. Check startup, service status, HTTP, and logs:
 
 ```bash
 sudo cloud-init status --wait
 sudo systemctl status nginx --no-pager
 curl -I http://localhost
 sudo journalctl -u nginx -n 30 --no-pager
+sudo tail -n 10 /var/log/nginx/access.log
 ```
 
-Check `sudo tail -n 50 /var/log/cloud-init-output.log` if installation failed.
-If Session Manager is unavailable, allow time for registration and check the
-instance role, internet route, and your session permissions.
+If installation fails, inspect `/var/log/cloud-init-output.log`. For Session
+Manager connection issues, check the instance role, SSM agent, and outbound route.
 
-For the first failure exercise, run `sudo systemctl stop nginx`. Confirm that
-`curl -I http://localhost` and a fresh browser request fail. Inspect service status
-and logs, then run `sudo systemctl start nginx` and verify HTTP works again.
-This is manual detection and recovery. The EC2 status-check alarm does not detect
-Nginx stopping; it monitors instance health, not HTTP availability.
+Reproduce the service recovery test in the lab:
 
-## Test email notifications
+```bash
+sudo systemctl stop nginx
+curl -I http://localhost
+sudo systemctl start nginx
+curl -I http://localhost
+```
 
-After applying, confirm the SNS subscription using the link sent to `alert_email`.
-Then run this in your local PowerShell terminal, using your configured AWS profile:
+The first HTTP request should fail; the second should return `200 OK`. Recovery
+in this test is performed manually using `systemctl`.
+
+After confirming the email subscription, test notification delivery from the local
+PowerShell terminal using the configured AWS profile:
 
 ```powershell
 aws cloudwatch set-alarm-state --alarm-name "linux-lab-status-check" --state-value ALARM --state-reason "Testing email notifications" --region us-east-1
 ```
 
-This temporarily changes the alarm state and tests notification delivery without
-causing a server failure. CloudWatch reevaluates the real metrics and returns to
-OK if healthy, sending another notification. An ALARM email was received during
-this exercise; detecting an actual EC2 status-check failure has not been tested.
+CloudWatch reevaluates the real metrics after this temporary state change. A return
+to OK triggers another notification through the same SNS topic.
 
-## Remove the environment
+## Teardown and costs
 
-Run from this same project folder with the same AWS profile and local settings:
+EC2 runtime, EBS storage, public IPv4, monitoring, notifications, and data transfer
+can incur charges. Resources remain deployed until explicitly removed.
+
+From the same project folder and AWS profile:
 
 ```powershell
 terraform destroy
 terraform state list
 ```
 
-Review the destruction plan and confirm it. The state list should then be empty.
-In the same AWS region, verify the lab instance is terminated, its root disk is
-gone, and the `linux-lab` VPC is gone. Stopping the instance alone leaves storage
-charges. Keep the local state files until destruction succeeds; if apply fails
-partway through, use the same state to finish cleanup.
-
-## Milestone checklist
-
-- [x] Terraform created the environment in my intended account.
-- [x] I opened the default Nginx page and connected through Session Manager.
-- [ ] I can explain the browser traffic path and the purpose of the instance role.
-- [x] I stopped Nginx, inspected the failure, and restored the service.
-- [x] I recorded the exercises and commands in this README.
-- [x] I confirmed the SNS subscription and received a test ALARM email.
-- [x] Terraform reported all 10 original resources destroyed; I then recreated them.
-- [ ] I verified teardown of the expanded lab including SNS and CloudWatch.
+Confirm successful destruction and check that no managed resources remain in state.
+Verify removal of the instance, root volume, VPC, SNS topic, and CloudWatch alarm
+in AWS. Stopping the instance alone leaves storage charges. Keep local state until
+cleanup succeeds. The separately installed deployment IAM policies remain.
 
 ## References
 
-- [Amazon Linux 2023 images and the public AMI parameter](https://docs.aws.amazon.com/linux/al2023/ug/ec2.html)
-- [Session Manager setup and permissions](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started.html)
+- [Amazon Linux 2023 on EC2](https://docs.aws.amazon.com/linux/al2023/ug/ec2.html)
+- [Session Manager setup](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started.html)
+- [CloudWatch alarm notification testing](https://docs.aws.amazon.com/cli/latest/reference/cloudwatch/set-alarm-state.html)
 - [EC2 pricing](https://aws.amazon.com/ec2/pricing/on-demand/), [EBS pricing](https://aws.amazon.com/ebs/pricing/), and [public IPv4 pricing](https://aws.amazon.com/vpc/pricing/)
