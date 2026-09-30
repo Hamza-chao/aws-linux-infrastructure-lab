@@ -6,7 +6,7 @@ instance runs Nginx as the workload, with administration through AWS Systems
 Manager Session Manager and EC2 health notifications through CloudWatch and SNS.
 
 **Technologies:** AWS EC2, VPC, IAM, Systems Manager, CloudWatch, SNS, EBS,
-Terraform, Linux, Bash, Nginx, and Git.
+Terraform, Linux, Bash, systemd, Nginx, and Git.
 
 ## Architecture and design
 
@@ -24,6 +24,7 @@ Terraform, Linux, Bash, Nginx, and Git.
   over two one-minute periods. SNS delivers notifications on ALARM and OK transitions.
 - **Local health checks:** a Bash script checks Nginx service status and HTTP
   responses, reports disk usage, and returns a status code for the two checks.
+  A systemd timer runs it approximately every minute, with output in the journal.
 - **Cost control:** T3 standard CPU credits, root volume deletion on instance
   termination, and explicit Terraform teardown after use.
 
@@ -36,15 +37,16 @@ Terraform, Linux, Bash, Nginx, and Git.
 | HTTP service | Opened the Nginx page and ran `curl -I http://localhost` | HTTP `200 OK` |
 | Service recovery | Stopped Nginx, checked HTTP, then restarted it | Connection failure while stopped; HTTP `200 OK` after restart |
 | Health-check script | Ran the script with Nginx stopped and then restarted | Both checks failed with exit status `1`, then passed with exit status `0` |
+| Scheduled checks | Inspected the timer schedule and service journal | Consecutive successful runs at 05:16:39 and 05:17:40 UTC on September 30, 2026 |
 | Linux operations | Inspected service logs, access logs, disk, memory, processes, and listening ports | Confirmed Nginx requests and examined server resource usage |
 | Infrastructure lifecycle | Destroyed and recreated the original infrastructure | Terraform reported 10 resources destroyed, then 10 recreated |
 | Alert delivery | Confirmed SNS email subscription and temporarily set the alarm to ALARM | Received the alarm notification by email |
 
 The alert test verified the CloudWatch-to-SNS delivery path using a simulated alarm
 state. The CloudWatch metric monitors EC2 status checks. The Bash script checks
-HTTP locally and reports results in the terminal; it does not send email or run
-on a schedule. Lifecycle verification above covers the
-original infrastructure before monitoring was added.
+HTTP locally and records scheduled results in the system journal. Email alerts
+remain tied to the EC2 status-check alarm. Lifecycle verification above covers
+the original infrastructure before monitoring was added.
 
 ## Repository contents
 
@@ -52,6 +54,8 @@ original infrastructure before monitoring was added.
 | --- | --- |
 | `main.tf` | Infrastructure, server bootstrap, monitoring, inputs, and outputs |
 | `lab-health-check.sh` | Nginx service and HTTP checks, disk usage report, and exit status |
+| `lab-health-check.service` | Runs the health-check script as `ssm-user` |
+| `lab-health-check.timer` | Schedules the service approximately every minute |
 | `terraform.tfvars.example` | Example region, allowed IPv4 address, and alert email |
 | `lab-access-policy.json` | Deployment and Session Manager permissions |
 | `lab-monitoring-policy.json` | Permissions for the lab's SNS topic and CloudWatch alarm |
@@ -146,8 +150,8 @@ echo "Exit status: $?"
 The script returns `0` when both the service and HTTP checks succeed, or `1`
 when either fails. Disk usage is informational; no disk threshold is evaluated.
 During the Nginx stop/start test, these statuses were verified as `1` and `0`
-respectively. The script currently runs on demand and is copied separately from
-Terraform provisioning. Shell files use LF line endings for Linux compatibility.
+respectively. The script can also run automatically through the systemd timer
+below. The script and unit files use LF line endings for Linux compatibility.
 
 After confirming the email subscription, test notification delivery from the local
 PowerShell terminal using the configured AWS profile:
@@ -158,6 +162,45 @@ aws cloudwatch set-alarm-state --alarm-name "linux-lab-status-check" --state-val
 
 CloudWatch reevaluates the real metrics after this temporary state change. A return
 to OK triggers another notification through the same SNS topic.
+
+## Scheduled health checks
+
+The service runs the script once and exits; the timer starts it again approximately
+one minute after its last activation. `OnBootSec=1min` schedules the first run
+one minute after boot, or immediately when the timer is started after that point.
+A completed `oneshot` service showing "Deactivated successfully" is expected.
+
+Install these files on the EC2 instance after Terraform deployment. Copy the
+repository's `lab-health-check.sh`, `lab-health-check.service`, and
+`lab-health-check.timer` into the Linux user's home directory first. Run the
+following commands in the instance's Session Manager terminal, where `ssm-user`
+already exists:
+
+```bash
+sudo install -m 0644 "$HOME/lab-health-check.sh" /usr/local/bin/lab-health-check.sh
+sudo install -m 0644 "$HOME/lab-health-check.service" /etc/systemd/system/lab-health-check.service
+sudo install -m 0644 "$HOME/lab-health-check.timer" /etc/systemd/system/lab-health-check.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now lab-health-check.timer
+```
+
+Inspect the schedule and results:
+
+```bash
+systemctl list-timers --all lab-health-check.timer
+sudo journalctl -u lab-health-check.service -n 20 --no-pager
+```
+
+The journal showed successful scheduled checks approximately one minute apart.
+The timer is configured to start on future boots; the recorded verification
+covers consecutive runs in the current boot. This installation is separate from
+Terraform provisioning and must be repeated after instance replacement.
+
+To stop scheduled checks and disable their startup on future boots:
+
+```bash
+sudo systemctl disable --now lab-health-check.timer
+```
 
 ## Teardown and costs
 

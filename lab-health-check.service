@@ -1,0 +1,7 @@
+[Unit]
+Description=Check Nginx service and HTTP response
+
+[Service]
+Type=oneshot
+User=ssm-user
+ExecStart=/bin/bash /usr/local/bin/lab-health-check.sh
