@@ -22,6 +22,8 @@ Terraform, Linux, Bash, Nginx, and Git.
   Separate deployment policies support Terraform and interactive administration.
 - **Monitoring:** a CloudWatch alarm evaluates EC2 `StatusCheckFailed` metrics
   over two one-minute periods. SNS delivers notifications on ALARM and OK transitions.
+- **Local health checks:** a Bash script checks Nginx service status and HTTP
+  responses, reports disk usage, and returns a status code for the two checks.
 - **Cost control:** T3 standard CPU credits, root volume deletion on instance
   termination, and explicit Terraform teardown after use.
 
@@ -33,13 +35,15 @@ Terraform, Linux, Bash, Nginx, and Git.
 | Remote administration | Connected through Session Manager | Interactive Linux shell without opening inbound SSH |
 | HTTP service | Opened the Nginx page and ran `curl -I http://localhost` | HTTP `200 OK` |
 | Service recovery | Stopped Nginx, checked HTTP, then restarted it | Connection failure while stopped; HTTP `200 OK` after restart |
+| Health-check script | Ran the script with Nginx stopped and then restarted | Both checks failed with exit status `1`, then passed with exit status `0` |
 | Linux operations | Inspected service logs, access logs, disk, memory, processes, and listening ports | Confirmed Nginx requests and examined server resource usage |
 | Infrastructure lifecycle | Destroyed and recreated the original infrastructure | Terraform reported 10 resources destroyed, then 10 recreated |
 | Alert delivery | Confirmed SNS email subscription and temporarily set the alarm to ALARM | Received the alarm notification by email |
 
 The alert test verified the CloudWatch-to-SNS delivery path using a simulated alarm
-state. The configured metric monitors EC2 status checks; Nginx HTTP availability
-requires a separate application check. Lifecycle verification above covers the
+state. The CloudWatch metric monitors EC2 status checks. The Bash script checks
+HTTP locally and reports results in the terminal; it does not send email or run
+on a schedule. Lifecycle verification above covers the
 original infrastructure before monitoring was added.
 
 ## Repository contents
@@ -47,6 +51,7 @@ original infrastructure before monitoring was added.
 | File | Purpose |
 | --- | --- |
 | `main.tf` | Infrastructure, server bootstrap, monitoring, inputs, and outputs |
+| `lab-health-check.sh` | Nginx service and HTTP checks, disk usage report, and exit status |
 | `terraform.tfvars.example` | Example region, allowed IPv4 address, and alert email |
 | `lab-access-policy.json` | Deployment and Session Manager permissions |
 | `lab-monitoring-policy.json` | Permissions for the lab's SNS topic and CloudWatch alarm |
@@ -129,6 +134,20 @@ curl -I http://localhost
 
 The first HTTP request should fail; the second should return `200 OK`. Recovery
 in this test is performed manually using `systemctl`.
+
+Run the health-check script on the EC2 instance after copying
+`lab-health-check.sh` from this repository to the Linux user's home directory:
+
+```bash
+bash "$HOME/lab-health-check.sh"
+echo "Exit status: $?"
+```
+
+The script returns `0` when both the service and HTTP checks succeed, or `1`
+when either fails. Disk usage is informational; no disk threshold is evaluated.
+During the Nginx stop/start test, these statuses were verified as `1` and `0`
+respectively. The script currently runs on demand and is copied separately from
+Terraform provisioning. Shell files use LF line endings for Linux compatibility.
 
 After confirming the email subscription, test notification delivery from the local
 PowerShell terminal using the configured AWS profile:
