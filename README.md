@@ -16,8 +16,10 @@ Terraform, Linux, Bash, systemd, Nginx, and Git.
   Administration uses Session Manager with no inbound SSH rule.
 - **Server:** Amazon Linux 2023 on a `t3.micro`, with an encrypted 8 GiB gp3 root
   volume and IMDSv2 required.
-- **Bootstrap:** a Bash startup script installs Nginx and enables Nginx and the
-  SSM agent to start automatically.
+- **Bootstrap:** EC2 user data installs Nginx, the health-check script, and the
+  systemd service and timer from this repository. Nginx, the SSM agent, and the
+  timer are enabled automatically. A dedicated `lab-health-check` Linux account
+  runs the checks without requiring an interactive login.
 - **Permissions:** an EC2 instance role provides the SSM agent's AWS permissions.
   Separate deployment policies support Terraform and interactive administration.
 - **Monitoring:** a CloudWatch alarm evaluates EC2 `StatusCheckFailed` metrics
@@ -46,7 +48,9 @@ The alert test verified the CloudWatch-to-SNS delivery path using a simulated al
 state. The CloudWatch metric monitors EC2 status checks. The Bash script checks
 HTTP locally and records scheduled results in the system journal. Email alerts
 remain tied to the EC2 status-check alarm. Lifecycle verification above covers
-the original infrastructure before monitoring was added.
+the original infrastructure before monitoring was added. Scheduled execution was
+verified with the manually installed units; automatic installation through EC2
+user data requires verification on the next deployment.
 
 ## Repository contents
 
@@ -54,7 +58,7 @@ the original infrastructure before monitoring was added.
 | --- | --- |
 | `main.tf` | Infrastructure, server bootstrap, monitoring, inputs, and outputs |
 | `lab-health-check.sh` | Nginx service and HTTP checks, disk usage report, and exit status |
-| `lab-health-check.service` | Runs the health-check script as `ssm-user` |
+| `lab-health-check.service` | Runs checks as the dedicated `lab-health-check` user |
 | `lab-health-check.timer` | Schedules the service approximately every minute |
 | `terraform.tfvars.example` | Example region, allowed IPv4 address, and alert email |
 | `lab-access-policy.json` | Deployment and Session Manager permissions |
@@ -102,14 +106,32 @@ terraform apply "lab.tfplan"
 terraform output
 ```
 
-Allow time for the startup script to install Nginx, then open `website_url` using
-HTTP from the permitted address. Confirm the SNS subscription using the email
-sent to `alert_email`.
+The instance startup script installs and enables Nginx and the scheduled checks.
+Terraform can finish before this script completes. Connect through Session Manager
+and wait for startup to finish:
+
+```bash
+sudo cloud-init status --wait
+systemctl is-enabled lab-health-check.timer
+systemctl is-active lab-health-check.timer
+sudo journalctl -u lab-health-check.service -n 20 --no-pager
+```
+
+The timer should report `enabled` and `active`. Allow approximately one minute for
+the first check, then confirm the journal shows passing checks. Open `website_url`
+using HTTP from the permitted address. A newly created SNS email subscription
+still requires confirmation using the link sent to `alert_email`.
 
 This is a single-instance lab using HTTP and local Terraform state. Its current
 scope covers provisioning and operations; it does not provide high availability
 or TLS. The AMI follows the latest Amazon Linux 2023 image, so a later plan may
-propose instance replacement. Changes to the startup script also replace the instance.
+propose instance replacement. Because `user_data_replace_on_change = true`,
+changes to the startup script or any of the three embedded health-check files
+also replace the instance. Review the plan before applying: replacement deletes
+the old root disk and its local files/logs, ends active sessions, and assigns a
+new instance ID and usually a new public IP. The alarm follows the new instance.
+Initial AWS authentication and deployment IAM policies remain prerequisites;
+Terraform provisions the lab and its server-side setup after those are configured.
 
 ## Operations and recovery
 
@@ -139,11 +161,10 @@ curl -I http://localhost
 The first HTTP request should fail; the second should return `200 OK`. Recovery
 in this test is performed manually using `systemctl`.
 
-Run the health-check script on the EC2 instance after copying
-`lab-health-check.sh` from this repository to the Linux user's home directory:
+Run the installed health-check script directly on the EC2 instance:
 
 ```bash
-bash "$HOME/lab-health-check.sh"
+bash /usr/local/bin/lab-health-check.sh
 echo "Exit status: $?"
 ```
 
@@ -170,19 +191,18 @@ one minute after its last activation. `OnBootSec=1min` schedules the first run
 one minute after boot, or immediately when the timer is started after that point.
 A completed `oneshot` service showing "Deactivated successfully" is expected.
 
-Install these files on the EC2 instance after Terraform deployment. Copy the
-repository's `lab-health-check.sh`, `lab-health-check.service`, and
-`lab-health-check.timer` into the Linux user's home directory first. Run the
-following commands in the instance's Session Manager terminal, where `ssm-user`
-already exists:
+`terraform apply` supplies the three checked-in health-check files in EC2 user
+data. The instance creates the `lab-health-check` system account, writes the
+script to `/usr/local/bin/` and the units to `/etc/systemd/system/`, reloads
+systemd, and enables the timer. Files are owned by root and use mode `0644`;
+the service runs the readable script through `/bin/bash` as `lab-health-check`.
 
-```bash
-sudo install -m 0644 "$HOME/lab-health-check.sh" /usr/local/bin/lab-health-check.sh
-sudo install -m 0644 "$HOME/lab-health-check.service" /etc/systemd/system/lab-health-check.service
-sudo install -m 0644 "$HOME/lab-health-check.timer" /etc/systemd/system/lab-health-check.timer
-sudo systemctl daemon-reload
-sudo systemctl enable --now lab-health-check.timer
-```
+The dedicated account has no login shell and does not depend on `ssm-user`, which
+SSM Agent creates when the first Session Manager session starts. File contents
+are embedded with Terraform's `filebase64()` function and decoded during startup,
+so their shell variables and quoting are preserved without downloading them from
+GitHub. This is first-boot configuration, not continuous configuration management:
+manual changes on an existing server are not automatically repaired by apply.
 
 Inspect the schedule and results:
 
@@ -193,8 +213,8 @@ sudo journalctl -u lab-health-check.service -n 20 --no-pager
 
 The journal showed successful scheduled checks approximately one minute apart.
 The timer is configured to start on future boots; the recorded verification
-covers consecutive runs in the current boot. This installation is separate from
-Terraform provisioning and must be repeated after instance replacement.
+covers consecutive runs in the current boot. The Terraform startup script now
+reinstalls this setup when an instance is created or replaced.
 
 To stop scheduled checks and disable their startup on future boots:
 

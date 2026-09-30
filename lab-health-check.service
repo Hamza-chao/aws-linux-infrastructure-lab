@@ -3,5 +3,5 @@ Description=Check Nginx service and HTTP response
 
 [Service]
 Type=oneshot
-User=ssm-user
+User=lab-health-check
 ExecStart=/bin/bash /usr/local/bin/lab-health-check.sh

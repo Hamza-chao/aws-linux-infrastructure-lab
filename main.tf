@@ -198,12 +198,27 @@ resource "aws_instance" "web" {
     cpu_credits = "standard"
   }
 
+  # Embed the checked-in files so a new server needs no manual setup.
   user_data = <<-BASH
     #!/bin/bash
     set -euo pipefail
     systemctl enable --now amazon-ssm-agent
     dnf install -y nginx
     systemctl enable --now nginx
+
+    # This account exists before anyone opens a Session Manager session.
+    if ! id -u lab-health-check >/dev/null 2>&1; then
+      useradd --system --no-create-home --shell /sbin/nologin lab-health-check
+    fi
+
+    install -d -m 0755 /usr/local/bin /etc/systemd/system
+    printf '%s' '${filebase64("${path.module}/lab-health-check.sh")}' | base64 --decode > /usr/local/bin/lab-health-check.sh
+    printf '%s' '${filebase64("${path.module}/lab-health-check.service")}' | base64 --decode > /etc/systemd/system/lab-health-check.service
+    printf '%s' '${filebase64("${path.module}/lab-health-check.timer")}' | base64 --decode > /etc/systemd/system/lab-health-check.timer
+    chmod 0644 /usr/local/bin/lab-health-check.sh /etc/systemd/system/lab-health-check.service /etc/systemd/system/lab-health-check.timer
+
+    systemctl daemon-reload
+    systemctl enable --now lab-health-check.timer
   BASH
 
   tags = { Name = "linux-lab-nginx" }
