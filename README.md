@@ -6,7 +6,7 @@ instance runs Nginx as the workload, with administration through AWS Systems
 Manager Session Manager and EC2 health notifications through CloudWatch and SNS.
 
 **Technologies:** AWS EC2, VPC, IAM, Systems Manager, CloudWatch, SNS, EBS,
-Terraform, Linux, Bash, systemd, Nginx, and Git.
+Terraform, Linux, Bash, systemd, Nginx, Git, and GitHub Actions.
 
 ## Architecture and design
 
@@ -40,6 +40,7 @@ Terraform, Linux, Bash, systemd, Nginx, and Git.
 | Service recovery | Stopped Nginx, checked HTTP, then restarted it | Connection failure while stopped; HTTP `200 OK` after restart |
 | Health-check script | Ran the script with Nginx stopped and then restarted | Both checks failed with exit status `1`, then passed with exit status `0` |
 | Scheduled checks | Inspected the timer schedule and service journal | Consecutive successful runs at 05:16:39 and 05:17:40 UTC on September 30, 2026 |
+| Reboot persistence | Rebooted the instance and inspected service status and the current-boot journal | Nginx active; timer enabled and active; scheduled checks passed |
 | Linux operations | Inspected service logs, access logs, disk, memory, processes, and listening ports | Confirmed Nginx requests and examined server resource usage |
 | Infrastructure lifecycle | Destroyed and recreated the original infrastructure | Terraform reported 10 resources destroyed, then 10 recreated |
 | Alert delivery | Confirmed SNS email subscription and temporarily set the alarm to ALARM | Received the alarm notification by email |
@@ -63,8 +64,31 @@ user data requires verification on the next deployment.
 | `terraform.tfvars.example` | Example region, allowed IPv4 address, and alert email |
 | `lab-access-policy.json` | Deployment and Session Manager permissions |
 | `lab-monitoring-policy.json` | Permissions for the lab's SNS topic and CloudWatch alarm |
+| `.github/workflows/terraform-checks.yml` | GitHub Actions checks for Terraform and Bash |
 | `.terraform.lock.hcl` | Pinned provider version and checksums |
 | `.gitignore` | Excludes local settings, state, saved plans, and credential files |
+
+## Continuous integration
+
+The `Infrastructure checks` workflow runs on pushes and pull requests. It can
+also be started manually from the repository's **Actions** tab with **Run workflow**.
+GitHub provides a fresh Ubuntu runner for these checks:
+
+1. Check Terraform formatting with `terraform fmt -check -recursive`.
+2. Initialize providers from the checked-in lock file with
+   `terraform init -backend=false -input=false -lockfile=readonly`.
+3. Validate the Terraform configuration with `terraform validate -no-color`.
+4. Check the health-check script's Bash syntax with `bash -n lab-health-check.sh`.
+
+The workflow pins Terraform to version 1.16.3 and uses a read-only repository
+token. These code checks require no AWS credentials and do not deploy resources.
+They can run while the AWS lab is destroyed. Deployments continue through the
+local Terraform plan and apply commands below. Bash syntax checking does not
+execute the script or establish that Nginx is healthy; runtime checks remain
+part of the EC2 operations exercises.
+
+Open the [workflow runs](https://github.com/Hamza-chao/aws-linux-infrastructure-lab/actions/workflows/terraform-checks.yml)
+to inspect each step's result and logs. A failed check marks the job as failed.
 
 ## Deployment
 
@@ -212,8 +236,8 @@ sudo journalctl -u lab-health-check.service -n 20 --no-pager
 ```
 
 The journal showed successful scheduled checks approximately one minute apart.
-The timer is configured to start on future boots; the recorded verification
-covers consecutive runs in the current boot. The Terraform startup script now
+Nginx and the timer were also verified running after a reboot, with passing
+checks recorded in the current-boot journal. The Terraform startup script now
 reinstalls this setup when an instance is created or replaced.
 
 To stop scheduled checks and disable their startup on future boots:
