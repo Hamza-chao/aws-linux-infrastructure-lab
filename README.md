@@ -87,6 +87,14 @@ local Terraform plan and apply commands below. Bash syntax checking does not
 execute the script or establish that Nginx is healthy; runtime checks remain
 part of the EC2 operations exercises.
 
+The provider lock file includes verified checksums for Windows and Linux. After
+upgrading a provider, refresh both platform checksums locally and commit the lock
+file so the runner can validate the same provider version:
+
+```powershell
+terraform providers lock -platform=windows_amd64 -platform=linux_amd64
+```
+
 Open the [workflow runs](https://github.com/Hamza-chao/aws-linux-infrastructure-lab/actions/workflows/terraform-checks.yml)
 to inspect each step's result and logs. A failed check marks the job as failed.
 
