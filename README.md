@@ -4,9 +4,11 @@ Terraform-managed AWS infrastructure demonstrating Linux administration, network
 access controls, service recovery, and email alerting. An Amazon Linux 2023 EC2
 instance runs Nginx as the workload, with administration through AWS Systems
 Manager Session Manager and EC2 health notifications through CloudWatch and SNS.
+Zabbix collects Linux metrics and sends HTTP problem and recovery notifications
+to a Mailtrap sandbox.
 
 **Technologies:** AWS EC2, VPC, IAM, Systems Manager, CloudWatch, SNS, EBS,
-Terraform, Linux, Bash, systemd, Nginx, Git, GitHub Actions, and Zabbix.
+Terraform, Linux, Bash, systemd, Nginx, Git, GitHub Actions, Zabbix, and Mailtrap.
 
 ## Architecture and design
 
@@ -30,8 +32,11 @@ Terraform, Linux, Bash, systemd, Nginx, Git, GitHub Actions, and Zabbix.
   A systemd timer runs it approximately every minute, with output in the journal.
 - **Host monitoring:** Terraform configures Zabbix Agent 2 for passive checks,
   accepting only the owner's public IP and TLS with a pre-shared key. A local
-  Zabbix server requests CPU, memory, and filesystem metrics. Deployment and
-  metric collection for this addition still require runtime verification.
+  Zabbix server requests CPU, memory, filesystem, network, and disk metrics.
+  Encrypted polling and metric collection were verified after deployment.
+- **HTTP monitoring:** a Zabbix web scenario checks the Nginx endpoint every
+  minute. Problem and recovery notifications are captured in a Mailtrap SMTP
+  sandbox. Nginx recovery is performed manually through Session Manager.
 - **Cost control:** T3 standard CPU credits, root volume deletion on instance
   termination, and explicit Terraform teardown after use.
 
@@ -48,15 +53,19 @@ Terraform, Linux, Bash, systemd, Nginx, Git, GitHub Actions, and Zabbix.
 | Reboot persistence | Rebooted the instance and inspected service status and the current-boot journal | Nginx active; timer enabled and active; scheduled checks passed |
 | Linux operations | Inspected service logs, access logs, disk, memory, processes, and listening ports | Confirmed Nginx requests and examined server resource usage |
 | Infrastructure lifecycle | Destroyed and recreated the original infrastructure | Terraform reported 10 resources destroyed, then 10 recreated |
-| Alert delivery | Confirmed SNS email subscription and temporarily set the alarm to ALARM | Received the alarm notification by email |
+| CloudWatch alert delivery | Confirmed SNS email subscription and temporarily set the alarm to ALARM | Received the alarm notification by email |
+| Zabbix host monitoring | Inspected Latest data and host dashboards | Collected CPU, memory, filesystem, network, and NVMe disk metrics |
+| HTTP failure detection | Stopped Nginx during controlled tests | Web scenario failed and an Average-severity problem opened |
+| HTTP notifications | Inspected Mailtrap after stopping and restarting Nginx | Captured problem and recovery messages; a recovery example records a 59-second problem duration |
 
-The alert test verified the CloudWatch-to-SNS delivery path using a simulated alarm
-state. The CloudWatch metric monitors EC2 status checks. The Bash script checks
-HTTP locally and records scheduled results in the system journal. Email alerts
-remain tied to the EC2 status-check alarm. Lifecycle verification above covers
-the original infrastructure before monitoring was added. Scheduled execution was
-verified with the manually installed units; automatic installation through EC2
-user data requires verification on the next deployment.
+The CloudWatch alert test verified the SNS delivery path using a simulated alarm
+state. That alarm monitors EC2 status checks. Zabbix separately checks HTTP
+availability and sends problem and recovery messages to Mailtrap. The Bash
+script checks HTTP locally and records scheduled results in the system journal.
+Lifecycle verification above covers the original infrastructure before monitoring
+was added. Scheduled execution was verified with the manually installed units;
+automatic installation through EC2 user data requires verification on the next
+deployment.
 
 ## Repository contents
 
@@ -108,8 +117,10 @@ to inspect each step's result and logs. A failed check marks the job as failed.
 Prerequisites: Terraform 1.10 or later (below 2.0), AWS CLI v2, and an authenticated
 AWS identity with the lab deployment permissions. Commands below use PowerShell.
 
-The IAM policy files use the lab account ID and `us-east-1`. Adapt their ARNs for
-another account. Install these policies using an identity authorized to manage
+The IAM policy files use the lab account ID and `us-east-1`; the subnet's
+Availability Zone is also fixed to `us-east-1a` in `main.tf`. Adapt the policy
+ARNs and subnet Availability Zone for another account or region. Install these
+policies using an identity authorized to manage
 IAM, and attach them to the deployment user group. The monitoring policy is a
 separate customer-managed policy. Deployment identity policies are managed
 outside this Terraform configuration.
@@ -347,6 +358,10 @@ The disk view shows the actual NVMe device and its read/write activity:
 
 ![Zabbix NVMe disk performance](docs/images/zabbix-disk-performance.png)
 
+The **Linux by Zabbix agent** template discovers Linux disks. For this host,
+`{$VFS.DEV.DEVNAME.MATCHES}` was set to `^nvme0n1$` to include only the instance's
+`nvme0n1` disk in discovery.
+
 Failure and recovery were also tested. Stopping `zabbix-agent2` caused Zabbix to
 raise **Linux: Zabbix agent is not available (for 3m)**. Starting the service
 again restored metric collection and cleared the problem. The graphs showed the
@@ -354,11 +369,46 @@ expected gap while the agent was stopped and new data after it restarted.
 
 ![Zabbix agent outage alert](docs/images/zabbix-agent-outage.png)
 
-The template initially discovered an `xvda` device that does not exist on this
-Amazon Linux instance; the actual EBS device is `nvme0n1`. The host macro
-`{$VFS.DEV.DEVNAME.MATCHES}` was set to `^nvme0n1$` so disk performance checks
-use the real device. The local Zabbix server's unused default agent warning is
-separate from the EC2 host and does not affect this monitoring path.
+The screenshots also show an agent warning for the default **Zabbix server**
+host. This is a separate host from the monitored EC2 instance, `linux-lab-nginx`.
+
+### HTTP incident and alert verification
+
+The Zabbix server runs the **Nginx HTTP availability** web scenario every minute.
+Its **GET homepage** step requests the Nginx `website_url` and requires HTTP
+status `200`. These HTTP requests run independently of the Linux agent checks.
+
+The **Nginx HTTP availability check failed** trigger uses the following expression
+with Average severity:
+
+```text
+last(/linux-lab-nginx/web.test.fail[Nginx HTTP availability])<>0
+```
+
+A successful scenario returns `0` for this item; a failed scenario returns the
+number of the failed step. A matching Zabbix action sends problem and recovery
+notifications through Mailtrap. The sandbox captures those SMTP messages in its
+test inbox, using `zabbix@lab.test` as sender and `alerts@lab.test` as recipient.
+
+The scenario, trigger, action, SMTP media type, and recipient are configured
+manually in Zabbix. After replacing the EC2 instance, update the scenario URL
+using `terraform output -raw website_url`.
+
+Controlled tests stopped Nginx with `sudo systemctl stop nginx`. The HTTP check
+failed and Zabbix opened the following problem:
+
+![Zabbix detected the Nginx HTTP outage](docs/images/zabbix-nginx-http-problem.png)
+
+Mailtrap captured an outage notification:
+
+![Mailtrap captured the Nginx outage alert](docs/images/mailtrap-nginx-problem-alert.png)
+
+Recovery was performed manually with `sudo systemctl start nginx`. Zabbix then
+cleared the problem and sent a recovery notification. The screenshots are
+examples from separate test runs; the recovery example records a Zabbix problem
+duration of 59 seconds.
+
+![Mailtrap captured the Nginx recovery alert](docs/images/mailtrap-nginx-recovery-alert.png)
 
 ## Teardown and costs
 
@@ -385,3 +435,5 @@ cleanup succeeds. The separately installed deployment IAM policies remain.
 - [EC2 pricing](https://aws.amazon.com/ec2/pricing/on-demand/), [EBS pricing](https://aws.amazon.com/ebs/pricing/), and [public IPv4 pricing](https://aws.amazon.com/vpc/pricing/)
 - [Zabbix Agent 2 configuration](https://www.zabbix.com/documentation/7.4/en/manual/appendix/config/zabbix_agent2)
 - [Zabbix TLS pre-shared keys](https://www.zabbix.com/documentation/7.4/en/manual/encryption/using_pre_shared_keys)
+- [Zabbix Linux template and disk discovery](https://www.zabbix.com/integrations/linux)
+- [Zabbix web monitoring items and failure triggers](https://www.zabbix.com/documentation/7.4/en/manual/web_monitoring/items)
