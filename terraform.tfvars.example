@@ -6,3 +6,7 @@ allowed_http_cidr = "203.0.113.10/32"
 
 # Replace with your email and confirm the SNS subscription after applying.
 alert_email = "your-email@example.com"
+
+# Generate a private 32-byte key (64 hex characters); keep the real value local.
+# Enter that same value in the Zabbix host's Encryption settings.
+zabbix_tls_psk = "REPLACE_WITH_YOUR_PRIVATE_64_CHARACTER_HEX_KEY"

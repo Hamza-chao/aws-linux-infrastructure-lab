@@ -16,3 +16,7 @@ Thumbs.db
 .DS_Store
 
 # Keep .terraform.lock.hcl: it records the provider version and checksums.
+
+# Local monitoring checkout/data and private Zabbix keys are not portfolio source.
+zabbix-docker/
+*.psk

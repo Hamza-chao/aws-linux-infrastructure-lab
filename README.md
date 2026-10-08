@@ -6,13 +6,14 @@ instance runs Nginx as the workload, with administration through AWS Systems
 Manager Session Manager and EC2 health notifications through CloudWatch and SNS.
 
 **Technologies:** AWS EC2, VPC, IAM, Systems Manager, CloudWatch, SNS, EBS,
-Terraform, Linux, Bash, systemd, Nginx, Git, and GitHub Actions.
+Terraform, Linux, Bash, systemd, Nginx, Git, GitHub Actions, and Zabbix.
 
 ## Architecture and design
 
 - **Networking:** dedicated VPC and public subnet, with an internet gateway and
   route table for internet connectivity.
 - **Access:** HTTP restricted to one configured public IPv4 address (`/32`).
+  Encrypted Zabbix agent checks on TCP 10050 use the same permitted address.
   Administration uses Session Manager with no inbound SSH rule.
 - **Server:** Amazon Linux 2023 on a `t3.micro`, with an encrypted 8 GiB gp3 root
   volume and IMDSv2 required.
@@ -27,6 +28,10 @@ Terraform, Linux, Bash, systemd, Nginx, Git, and GitHub Actions.
 - **Local health checks:** a Bash script checks Nginx service status and HTTP
   responses, reports disk usage, and returns a status code for the two checks.
   A systemd timer runs it approximately every minute, with output in the journal.
+- **Host monitoring:** Terraform configures Zabbix Agent 2 for passive checks,
+  accepting only the owner's public IP and TLS with a pre-shared key. A local
+  Zabbix server requests CPU, memory, and filesystem metrics. Deployment and
+  metric collection for this addition still require runtime verification.
 - **Cost control:** T3 standard CPU credits, root volume deletion on instance
   termination, and explicit Terraform teardown after use.
 
@@ -61,7 +66,7 @@ user data requires verification on the next deployment.
 | `lab-health-check.sh` | Nginx service and HTTP checks, disk usage report, and exit status |
 | `lab-health-check.service` | Runs checks as the dedicated `lab-health-check` user |
 | `lab-health-check.timer` | Schedules the service approximately every minute |
-| `terraform.tfvars.example` | Example region, allowed IPv4 address, and alert email |
+| `terraform.tfvars.example` | Example region, allowed IPv4 address, alert email, and monitoring key |
 | `lab-access-policy.json` | Deployment and Session Manager permissions |
 | `lab-monitoring-policy.json` | Permissions for the lab's SNS topic and CloudWatch alarm |
 | `.github/workflows/terraform-checks.yml` | GitHub Actions checks for Terraform and Bash |
@@ -117,7 +122,8 @@ Copy-Item terraform.tfvars.example terraform.tfvars
 ```
 
 Set `allowed_http_cidr` to your current public IPv4 address followed by `/32`, and
-set `alert_email` to your email address. Update the allowed address if your network
+set `alert_email` to your email address. Set `zabbix_tls_psk` to a privately generated
+64-character hexadecimal key. Update the allowed address if your network
 changes. Keep `terraform.tfvars` local.
 
 Authenticate your AWS CLI profile, then validate and review the deployment:
@@ -156,10 +162,12 @@ still requires confirmation using the link sent to `alert_email`.
 
 This is a single-instance lab using HTTP and local Terraform state. Its current
 scope covers provisioning and operations; it does not provide high availability
-or TLS. The AMI follows the latest Amazon Linux 2023 image, so a later plan may
+or HTTPS for the website. The AMI follows the latest Amazon Linux 2023 image, so a later plan may
 propose instance replacement. Because `user_data_replace_on_change = true`,
 changes to the startup script or any of the three embedded health-check files
-also replace the instance. Review the plan before applying: replacement deletes
+also replace the instance. Changing the monitoring key or permitted public IP
+changes the agent startup configuration and replaces the instance too. Review
+the plan before applying: replacement deletes
 the old root disk and its local files/logs, ends active sessions, and assigns a
 new instance ID and usually a new public IP. The alarm follows the new instance.
 Initial AWS authentication and deployment IAM policies remain prerequisites;
@@ -254,6 +262,104 @@ To stop scheduled checks and disable their startup on future boots:
 sudo systemctl disable --now lab-health-check.timer
 ```
 
+## Zabbix host monitoring
+
+The local Zabbix server polls the EC2 agent on TCP 10050 using TLS with a shared
+key. Both the security group and the agent restrict callers to
+`allowed_http_cidr`. No inbound connection to the home router is required.
+The agent uses the official Zabbix 7.4 repository for Amazon Linux 2023 and runs
+as the package's `zabbix` account. Its key file is owned by root, readable by the
+`zabbix` group, and written with Linux line endings. Active checks are disabled.
+
+The monitoring dashboard, database, and server run on the laptop through the
+official [Zabbix Docker setup](https://www.zabbix.com/documentation/7.4/en/manual/installation/containers),
+separately from AWS Terraform. The local `zabbix-docker/` checkout is excluded
+from this repository. On Windows, select the image tag in the PowerShell session
+to avoid the host's `OS=Windows_NT` environment variable overriding image selection:
+
+```powershell
+$env:ZBX_IMAGE_TAG = "alpine-7.4-latest"
+docker compose -f ./compose.yaml up -d
+```
+
+Run those commands in the `zabbix-docker` folder. The laptop must remain awake,
+connected, and running Docker for collection and Zabbix alerts to work. CloudWatch
+EC2 status-check notifications remain independent of the laptop.
+
+For a new installation, generate a random key locally in PowerShell and copy
+the result into `zabbix_tls_psk` in `terraform.tfvars`:
+
+```powershell
+$zabbixKeyBytes = New-Object byte[] 32
+$zabbixKeyGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$zabbixKeyGenerator.GetBytes($zabbixKeyBytes)
+$zabbixKeyGenerator.Dispose()
+-join ($zabbixKeyBytes | ForEach-Object { $_.ToString("x2") })
+```
+
+Use that same key in the Zabbix host settings; keep it private.
+Keep the real `zabbix_tls_psk` value in ignored `terraform.tfvars`. Terraform's
+`sensitive` flag hides it from normal command output, but the key remains in local
+state, saved plans, and EC2 user data. Keep those artifacts private as well.
+The example file intentionally contains a placeholder, not a working key.
+
+Review a fresh Terraform plan before applying. The updated user data replaces
+the existing EC2 instance and deletes its old root disk. When startup finishes:
+
+```bash
+sudo cloud-init status --wait
+systemctl is-active zabbix-agent2
+sudo journalctl -b -u zabbix-agent2 -n 20 --no-pager
+```
+
+In the Zabbix dashboard, open **Data collection > Hosts > Create host**:
+
+- Host name: `linux-lab-nginx`.
+- Template: **Linux by Zabbix agent**, for passive checks.
+- Host group: **Linux servers**, or another suitable group.
+- Agent interface: the public IPv4 from `terraform output -raw zabbix_agent_ip`,
+  connect using IP, port `10050`.
+- Encryption: **Connections to host: PSK**. For **Connections from host**, allow
+  PSK only. Set PSK identity to `linux-lab-nginx` and PSK to the private value from
+  `terraform.tfvars`.
+
+Save the host and inspect **Monitoring > Latest data** after collection starts.
+Host registration is currently a dashboard step, not an automated Terraform
+resource. After instance replacement or destroy/recreate, update the existing
+host's interface to the new public IP. Both machines must use the same key and
+identity. If the laptop's public IP changes, update `allowed_http_cidr` and review
+the replacement plan. VPN use can also change the source IP seen by EC2.
+
+The Zabbix host was verified after deployment: encrypted passive polling returned
+CPU, memory, filesystem, network, and NVMe disk metrics in **Monitoring > Latest
+data**. The host dashboard displayed approximately 21% root filesystem usage,
+low CPU utilization, and low disk wait time.
+
+### Monitoring evidence
+
+The dashboard shows the collected Linux performance and filesystem metrics:
+
+![Zabbix system performance dashboard](docs/images/zabbix-system-performance.png)
+
+![Zabbix latest data](docs/images/zabbix-latest-data.png)
+
+The disk view shows the actual NVMe device and its read/write activity:
+
+![Zabbix NVMe disk performance](docs/images/zabbix-disk-performance.png)
+
+Failure and recovery were also tested. Stopping `zabbix-agent2` caused Zabbix to
+raise **Linux: Zabbix agent is not available (for 3m)**. Starting the service
+again restored metric collection and cleared the problem. The graphs showed the
+expected gap while the agent was stopped and new data after it restarted.
+
+![Zabbix agent outage alert](docs/images/zabbix-agent-outage.png)
+
+The template initially discovered an `xvda` device that does not exist on this
+Amazon Linux instance; the actual EBS device is `nvme0n1`. The host macro
+`{$VFS.DEV.DEVNAME.MATCHES}` was set to `^nvme0n1$` so disk performance checks
+use the real device. The local Zabbix server's unused default agent warning is
+separate from the EC2 host and does not affect this monitoring path.
+
 ## Teardown and costs
 
 EC2 runtime, EBS storage, public IPv4, monitoring, notifications, and data transfer
@@ -277,3 +383,5 @@ cleanup succeeds. The separately installed deployment IAM policies remain.
 - [Session Manager setup](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started.html)
 - [CloudWatch alarm notification testing](https://docs.aws.amazon.com/cli/latest/reference/cloudwatch/set-alarm-state.html)
 - [EC2 pricing](https://aws.amazon.com/ec2/pricing/on-demand/), [EBS pricing](https://aws.amazon.com/ebs/pricing/), and [public IPv4 pricing](https://aws.amazon.com/vpc/pricing/)
+- [Zabbix Agent 2 configuration](https://www.zabbix.com/documentation/7.4/en/manual/appendix/config/zabbix_agent2)
+- [Zabbix TLS pre-shared keys](https://www.zabbix.com/documentation/7.4/en/manual/encryption/using_pre_shared_keys)

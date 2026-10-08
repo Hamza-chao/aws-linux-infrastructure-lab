@@ -63,6 +63,17 @@ variable "allowed_http_cidr" {
   }
 }
 
+variable "zabbix_tls_psk" {
+  description = "Private 64-character hexadecimal key shared with the local Zabbix server."
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition     = can(regex("^[0-9a-fA-F]{64}$", var.zabbix_tls_psk))
+    error_message = "Use a randomly generated 64-character hexadecimal key."
+  }
+}
+
 provider "aws" {
   region = var.aws_region
 
@@ -84,8 +95,9 @@ resource "aws_vpc" "lab" {
 }
 
 resource "aws_subnet" "public" {
-  vpc_id     = aws_vpc.lab.id
-  cidr_block = "10.42.1.0/24"
+  vpc_id            = aws_vpc.lab.id
+  cidr_block        = "10.42.1.0/24"
+  availability_zone = "us-east-1a"
 
   tags = { Name = "linux-lab-public" }
 }
@@ -112,7 +124,7 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# Firewall: allow your browser on port 80. Administration uses Session Manager.
+# Firewall: HTTP and encrypted Zabbix checks from your public IP. Administration uses SSM.
 resource "aws_security_group" "web" {
   name_prefix = "linux-lab-"
   description = "Nginx HTTP from your public IP"
@@ -122,6 +134,14 @@ resource "aws_security_group" "web" {
     description = "Nginx from your public IPv4 address"
     from_port   = 80
     to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_http_cidr]
+  }
+
+  ingress {
+    description = "Encrypted Zabbix agent checks from your public IPv4 address"
+    from_port   = 10050
+    to_port     = 10050
     protocol    = "tcp"
     cidr_blocks = [var.allowed_http_cidr]
   }
@@ -219,6 +239,26 @@ resource "aws_instance" "web" {
 
     systemctl daemon-reload
     systemctl enable --now lab-health-check.timer
+
+    # Passive checks: the laptop requests metrics; EC2 requires the shared TLS key.
+    if ! rpm -q zabbix-release >/dev/null 2>&1; then
+      rpm -Uvh https://repo.zabbix.com/zabbix/7.4/release/amazonlinux/2023/noarch/zabbix-release-latest-7.4.amzn2023.noarch.rpm
+    fi
+    dnf install -y zabbix-agent2
+
+    install -o root -g zabbix -m 0640 /dev/null /etc/zabbix/agent.psk
+    printf '%s\n' '${var.zabbix_tls_psk}' > /etc/zabbix/agent.psk
+    cat > /etc/zabbix/zabbix_agent2.conf <<'ZABBIX_CONFIG'
+    LogType=console
+    Server=${var.allowed_http_cidr}
+    Hostname=linux-lab-nginx
+    TLSConnect=psk
+    TLSAccept=psk
+    TLSPSKIdentity=linux-lab-nginx
+    TLSPSKFile=/etc/zabbix/agent.psk
+    ZABBIX_CONFIG
+    chmod 0644 /etc/zabbix/zabbix_agent2.conf
+    systemctl enable --now zabbix-agent2
   BASH
 
   tags = { Name = "linux-lab-nginx" }
@@ -232,4 +272,9 @@ output "website_url" {
 output "instance_id" {
   description = "Select this instance in the EC2 console to connect through Session Manager."
   value       = aws_instance.web.id
+}
+
+output "zabbix_agent_ip" {
+  description = "Public IPv4 address to use for the encrypted Zabbix agent interface on port 10050."
+  value       = aws_instance.web.public_ip
 }
